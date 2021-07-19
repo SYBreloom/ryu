@@ -27,8 +27,9 @@ LOG = logging.getLogger(__name__)
 
 
 class DiscoveryEventDumper(app_manager.RyuApp):
-    ''' This app dumps discovery events
-    '''
+    """
+    This app dumps discovery events
+    """
     _CONTEXTS = {
         'switches': switches.Switches,
     }

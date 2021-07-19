@@ -94,7 +94,7 @@ def _create_ofp_msg_ev_class(msg_cls):
 def _create_ofp_msg_ev_from_module(ofp_parser):
     # print mod
     for _k, cls in inspect.getmembers(ofp_parser, inspect.isclass):
-        if not hasattr(cls, 'cls_msg_type'):
+        if not hasattr(cls, 'cls_msg_type'):  # 过滤掉ofproto_v1_x_parser.py 里面, 不属于msg 的class
             continue
         _create_ofp_msg_ev_class(cls)
 

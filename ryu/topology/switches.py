@@ -162,6 +162,7 @@ class Link(object):
 
 class Host(object):
     # This is data class passed by EventHostXXX
+    # 表示和哪个Port对象连接，这个Port对应的dpid是edge_switch
     def __init__(self, mac, port):
         super(Host, self).__init__()
         self.port = port
@@ -510,17 +511,18 @@ class Switches(app_manager.RyuApp):
     LLDP_SEND_PERIOD_PER_PORT = .9
     TIMEOUT_CHECK_PERIOD = 5.
     LINK_TIMEOUT = TIMEOUT_CHECK_PERIOD * 2
-    LINK_LLDP_DROP = 5
+    LINK_LLDP_DROP = 5  # 判断一端连续多少次发出LLDP, 而对端没有Packet-In响应
 
     def __init__(self, *args, **kwargs):
         super(Switches, self).__init__(*args, **kwargs)
 
         self.name = 'switches'
         self.dps = {}                 # datapath_id => Datapath class
-        self.port_state = {}          # datapath_id => ports
-        self.ports = PortDataState()  # Port class -> PortData class
-        self.links = LinkState()      # Link class -> timestamp
-        self.hosts = HostState()      # mac address -> Host class list
+        self.port_state = {}          # datapath_id => PortState class 保存端口信息(PortState 是 port_no -> OFPPort port)
+
+        self.ports = PortDataState()  # Port class -> PortData class  这里记录端口发送的 lldp 信息
+        self.links = LinkState()      # Link class -> timestamp  只有 lldp_packet_in_handler 获取LLDP pkt-in的时候赋值，失效时删除
+        self.hosts = HostState()      # mac address -> Host class list host_discovery的时候，获取连接到edge_switch的host信息
         self.is_active = True
 
         self.link_discovery = self.CONF.observe_links
@@ -539,7 +541,12 @@ class Switches(app_manager.RyuApp):
             self.link_event.set()
             hub.joinall(self.threads)
 
+    """
+    只有EventOFPStateChange(MAIN_DISPATCHER)的时候，使用了register; (DEAD_DISPATCHER)的时候用了unregister
+    """
     def _register(self, dp):
+        #  注册了dp到dps， 赋给self.dps
+        #  注册了dp所对应的ports信息（PortState），赋给self.port_state
         assert dp.id is not None
 
         self.dps[dp.id] = dp
@@ -549,12 +556,14 @@ class Switches(app_manager.RyuApp):
                 self.port_state[dp.id].add(port.port_no, port)
 
     def _unregister(self, dp):
+        # 删除dps和port_state里关于dp的信息
         if dp.id in self.dps:
-            if (self.dps[dp.id] == dp):
+            if self.dps[dp.id] == dp:
                 del self.dps[dp.id]
                 del self.port_state[dp.id]
 
     def _get_switch(self, dpid):
+        # 给定dpid, 搜索自己的dps，构造一个switch对象并返回
         if dpid in self.dps:
             switch = Switch(self.dps[dpid])
             for ofpport in self.port_state[dpid].values():
@@ -562,6 +571,7 @@ class Switches(app_manager.RyuApp):
             return switch
 
     def _get_port(self, dpid, port_no):
+        # 给定dpid和port_no, 搜索自己的port_state{}, 返回Port class
         switch = self._get_switch(dpid)
         if switch:
             for p in switch.ports:
@@ -569,9 +579,10 @@ class Switches(app_manager.RyuApp):
                     return p
 
     def _port_added(self, port):
+        # 给self.ports赋值，其实就是添加lldp_data信息，确定以后自己要发什么
         lldp_data = LLDPPacket.lldp_packet(
             port.dpid, port.port_no, port.hw_addr, self.DEFAULT_TTL)
-        self.ports.add_port(port, lldp_data)
+        self.ports.add_port(port, lldp_data)  # 添加lldp_data信息
         # LOG.debug('_port_added dpid=%s, port_no=%s, live=%s',
         #           port.dpid, port.port_no, port.is_live())
 
@@ -590,6 +601,7 @@ class Switches(app_manager.RyuApp):
         self.ports.move_front(dst)
 
     def _is_edge_port(self, port):
+        # 判断那些不属于 link 的 src 和 dst 的port
         for link in self.links:
             if port == link.src or port == link.dst:
                 return False
@@ -604,13 +616,15 @@ class Switches(app_manager.RyuApp):
         LOG.debug(dp)
 
         if ev.state == MAIN_DISPATCHER:
+            # 连接建立时调用，此时已经经过ofp_handler里面的CONFIG_STATE，dp 已经具有了ports这个dict
+            # 这里通过 _register(dp) 存储这个dp的dp_no和端口信息
             dp_multiple_conns = False
             if dp.id in self.dps:
                 LOG.warning('Multiple connections from %s', dpid_to_str(dp.id))
                 dp_multiple_conns = True
                 (self.dps[dp.id]).close()
 
-            self._register(dp)
+            self._register(dp)  # 注册dp, 给 self.dps 和 self.port_state 赋值
             switch = self._get_switch(dp.id)
             LOG.debug('register %s', switch)
 
@@ -664,7 +678,7 @@ class Switches(app_manager.RyuApp):
             if not dp_multiple_conns:
                 for port in switch.ports:
                     if not port.is_reserved():
-                        self._port_added(port)
+                        self._port_added(port)  # 为self.ports添加需要发送的PortData信息
 
             self.lldp_event.set()
 
@@ -701,14 +715,14 @@ class Switches(app_manager.RyuApp):
             # LOG.debug('A port was added.' +
             #           '(datapath id = %s, port number = %s)',
             #           dp.id, ofpport.port_no)
-            self.port_state[dp.id].add(ofpport.port_no, ofpport)
+            self.port_state[dp.id].add(ofpport.port_no, ofpport)  # self.port_state添加新的port
             self.send_event_to_observers(
                 event.EventPortAdd(Port(dp.id, dp.ofproto, ofpport)))
 
             if not self.link_discovery:
                 return
 
-            port = self._get_port(dp.id, ofpport.port_no)
+            port = self._get_port(dp.id, ofpport.port_no)  # 分配self.ports添加应该发的lldp信息
             if port and not port.is_reserved():
                 self._port_added(port)
                 self.lldp_event.set()
@@ -778,7 +792,7 @@ class Switches(app_manager.RyuApp):
             # not-LLDP packet. Ignore it silently
             return
 
-        dst_dpid = msg.datapath.id
+        dst_dpid = msg.datapath.id  # dst 表示本机端口
         if msg.datapath.ofproto.OFP_VERSION == ofproto_v1_0.OFP_VERSION:
             dst_port_no = msg.in_port
         elif msg.datapath.ofproto.OFP_VERSION >= ofproto_v1_2.OFP_VERSION:
@@ -787,11 +801,11 @@ class Switches(app_manager.RyuApp):
             LOG.error('cannot accept LLDP. unsupported version. %x',
                       msg.datapath.ofproto.OFP_VERSION)
 
-        src = self._get_port(src_dpid, src_port_no)
+        src = self._get_port(src_dpid, src_port_no)  # 根据 dpid 和 src 获取 Port对象
         if not src or src.dpid == dst_dpid:
             return
         try:
-            self.ports.lldp_received(src)
+            self.ports.lldp_received(src)  # 更新src port的
         except KeyError:
             # There are races between EventOFPPacketIn and
             # EventDPPortAdd. So packet-in event can happend before
@@ -799,10 +813,11 @@ class Switches(app_manager.RyuApp):
             # LOG.debug('lldp_received error', exc_info=True)
             pass
 
-        dst = self._get_port(dst_dpid, dst_port_no)
+        dst = self._get_port(dst_dpid, dst_port_no)  # 根据 dpid 和 dst_port_no 获取Port对象
         if not dst:
             return
 
+        # 如果旧link的dst和当前不同，删除旧的link
         old_peer = self.links.get_peer(src)
         # LOG.debug("Packet-In")
         # LOG.debug("  src=%s", src)
@@ -813,9 +828,13 @@ class Switches(app_manager.RyuApp):
             del self.links[old_link]
             self.send_event_to_observers(event.EventLinkDelete(old_link))
 
+        # 构建新的link, 如果是新的link, 删除self.hosts的信息
+        # todo 6.23 个人觉得这个里面，有对于 self._is_edge_port(host.port) 的判断，应该先更新本次事件所产生的link, 然后再判断才对吧
         link = Link(src, dst)
         if link not in self.links:
             self.send_event_to_observers(event.EventLinkAdd(link))
+
+            # 对于原本直连host的port, 如果此时不是edge_port，则删除host
 
             # remove hosts if it's not attached to edge port
             host_to_del = []
@@ -826,6 +845,7 @@ class Switches(app_manager.RyuApp):
             for host_mac in host_to_del:
                 del self.hosts[host_mac]
 
+        # 更新link，并获取反向link
         if not self.links.update_link(src, dst):
             # reverse link is not detected yet.
             # So schedule the check early because it's very likely it's up
@@ -836,6 +856,9 @@ class Switches(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def host_discovery_packet_in_handler(self, ev):
+        """
+        只在edge_port运行, 只处理 非LLDP 和 非CFM 的 packet-in 信息
+        """
         msg = ev.msg
         eth, pkt_type, pkt_data = ethernet.ethernet.parser(msg.data)
 
@@ -870,7 +893,7 @@ class Switches(app_manager.RyuApp):
             self.send_event_to_observers(ev)
         elif self.hosts[host_mac].port != port:
             # assumes the host is moved to another port
-            ev = event.EventHostMove(src=self.hosts[host_mac], dst=host)
+            ev = event.EventHostMove(src=self.hosts[host_mac], dst=host)  # 这个event 没有在self._EVENT里申明，也没有handler
             self.hosts[host_mac] = host
             self.send_event_to_observers(ev)
 
@@ -922,14 +945,17 @@ class Switches(app_manager.RyuApp):
                       dp.ofproto.OFP_VERSION)
 
     def lldp_loop(self):
+        """
+        遍历self.ports, 对每个port发送lldp
+        """
         while self.is_active:
-            self.lldp_event.clear()
+            self.lldp_event.clear()  # 设置self._cond为false, 此时lldp_event可以进入wait
 
             now = time.time()
             timeout = None
             ports_now = []
             ports = []
-            for (key, data) in self.ports.items():
+            for (key, data) in self.ports.items():  # key是Port 对象， data是PortData
                 if data.timestamp is None:
                     ports_now.append(key)
                     continue
@@ -951,9 +977,12 @@ class Switches(app_manager.RyuApp):
             if timeout is not None and ports:
                 timeout = 0     # We have already slept
             # LOG.debug('lldp sleep %s', timeout)
-            self.lldp_event.wait(timeout=timeout)
+            self.lldp_event.wait(timeout=timeout)  # 类似于hub.sleep(), 但是如果收到lldp_event.set()就会跳出。
 
     def link_loop(self):
+        """
+        用于清理一端没有收到LLDP的Link 对象， 每隔 5s 进行一次删除
+        """
         while self.is_active:
             self.link_event.clear()
 
@@ -966,11 +995,11 @@ class Switches(app_manager.RyuApp):
                     if src in self.ports:
                         port_data = self.ports.get_port(src)
                         # LOG.debug('port_data %s', port_data)
-                        if port_data.lldp_dropped() > self.LINK_LLDP_DROP:
+                        if port_data.lldp_dropped() > self.LINK_LLDP_DROP:  # 就是根据portState里sent数量判断的
                             deleted.append(link)
 
             for link in deleted:
-                self.links.link_down(link)
+                self.links.link_down(link)  # 清理 linkState 的key
                 # LOG.debug('delete %s', link)
                 self.send_event_to_observers(event.EventLinkDelete(link))
 
@@ -986,6 +1015,10 @@ class Switches(app_manager.RyuApp):
                         self.lldp_event.set()
 
             self.link_event.wait(timeout=self.TIMEOUT_CHECK_PERIOD)
+
+    """
+    后面这三个handler, 都是处理 Restful API 的内容的
+    """
 
     @set_ev_cls(event.EventSwitchRequest)
     def switch_request_handler(self, req):

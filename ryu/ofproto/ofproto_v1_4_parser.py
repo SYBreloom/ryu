@@ -1574,7 +1574,7 @@ class OFPTableMod(MsgBase):
             ofp = datapath.ofproto
             ofp_parser = datapath.ofproto_parser
 
-            req = ofp_parser.OFPTableMod(datapath, 1, 3)
+            req = ofp_parser.OFPTableMod(datapath, 1, 3)  # datapath, table_id, config, properties
             flags = ofp.OFPTC_VACANCY_EVENTS
             properties = [ofp_parser.OFPTableModPropEviction(flags)]
             req = ofp_parser.OFPTableMod(datapath, 1, 3, properties)
